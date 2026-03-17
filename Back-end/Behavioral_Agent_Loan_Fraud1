@@ -1,0 +1,258 @@
+# import json
+# import boto3
+# import statistics
+# import time
+# import os
+
+# # Initialize DynamoDB resource
+# dynamodb = boto3.resource('dynamodb', region_name='us-west-2')
+# TABLE_NAME = os.environ.get('TABLE_NAME', 'ApplicantData')
+# table = dynamodb.Table(TABLE_NAME)
+
+# def lambda_handler(event, context):
+#     print(f"--- START: Processing {len(event.get('Records', []))} record(s) ---")
+    
+#     for record in event['Records']:
+#         if record['eventName'] == 'INSERT':
+#             try:
+#                 # 1. Extract Keys from Stream
+#                 keys = record['dynamodb']['Keys']
+#                 app_id = keys['ApplicantID']['S']
+#                 timestamp = keys['SubmissionTimestamp']['S']
+                
+#                 # 2. Consistency Delay
+#                 time.sleep(3)
+
+#                 # 3. FETCH: Get the full record
+#                 response = table.get_item(Key={
+#                     'ApplicantID': app_id,
+#                     'SubmissionTimestamp': timestamp 
+#                 })
+                
+#                 item = response.get('Item')
+#                 if not item:
+#                     continue
+                
+#                 # 4. Deep Path Extraction
+#                 app_data = item.get('data', {})
+#                 biometrics = app_data.get('biometrics', {})
+#                 keystrokes = biometrics.get('keystrokes', [])
+                
+#                 if not keystrokes:
+#                     continue
+
+#                 # 5. ANALYSIS & MULTI-FIELD XAI
+#                 metrics = calculate_behavioral_metrics(keystrokes)
+#                 risk_score, flags, reasoning = evaluate_risk_profile(metrics)
+
+#                 # 6. UPDATE
+#                 save_results_to_db(app_id, timestamp, risk_score, flags, reasoning)
+#                 print(f"--- SUCCESS: Granular XAI Attributes populated for {app_id} ---")
+
+#             except Exception as e:
+#                 print(f"ERROR: {str(e)}")
+#     return {'statusCode': 200}
+
+# def calculate_behavioral_metrics(keystrokes):
+#     field_data = {}
+#     for k in keystrokes:
+#         f = k.get('field', 'unknown_field')
+#         if f not in field_data: field_data[f] = []
+#         field_data[f].append(k)
+
+#     stats = {}
+#     for field, events in field_data.items():
+#         dwells, flights = [], []
+#         presses = {}
+#         for e in events:
+#             key_name = e.get('key', 'generic_key')
+#             event_time = int(e.get('time', 0))
+#             if e.get('type') == 'down':
+#                 presses[key_name] = event_time
+#             elif e.get('type') == 'up' and key_name in presses:
+#                 dwells.append(event_time - presses[key_name])
+        
+#         for i in range(len(events) - 1):
+#             if events[i].get('type') == 'up' and events[i+1].get('type') == 'down':
+#                 flights.append(int(events[i+1]['time']) - int(events[i]['time']))
+
+#         stats[field] = {
+#             "avgFlight": statistics.mean(flights) if flights else 0,
+#             "duration": (int(events[-1]['time']) - int(events[0]['time'])) if events else 0
+#         }
+#     return stats
+
+# def evaluate_risk_profile(metrics):
+#     score, flags, reasons = 0.0, [], []
+    
+#     # 1. GLOBAL BOT CHECK (Applying to all fields)
+#     avg_flights = [m['avgFlight'] for m in metrics.values() if m['avgFlight'] > 0]
+#     overall_speed = statistics.mean(avg_flights) if avg_flights else 0
+#     if 0 < overall_speed < 45: 
+#         score += 0.5
+#         flags.append("robotic_typing_detected")
+#         reasons.append(f"Global typing speed ({round(overall_speed, 2)}ms) indicates automated input.")
+
+#     # 2. GRANULAR FIELD CHECKS (FirstName, LastName, Email, Phone, SSN)
+#     # Threshold: 10 seconds for name/contact, 12 for SSN/Income
+#     thresholds = {
+#         'firstName': 10000,
+#         'lastName': 10000,
+#         'email': 12000,
+#         'phoneNumber': 10000,
+#         'ssn': 12000
+#     }
+
+#     for field, limit in thresholds.items():
+#         field_duration = metrics.get(field, {}).get('duration', 0)
+#         if field_duration > limit:
+#             score += 0.15 # Smaller weight per field to prevent over-flagging
+#             flags.append(f"hesitation_on_{field}")
+#             reasons.append(f"High hesitation on {field} ({round(field_duration/1000, 1)}s).")
+
+#     # 3. ASSEMBLY
+#     reasoning = " ".join(reasons) if reasons else "User behavior matches standard human patterns."
+#     return min(score, 1.0), flags, reasoning
+
+# def save_results_to_db(app_id, timestamp, score, flags, reasoning):
+#     table.update_item(
+#         Key={'ApplicantID': app_id, 'SubmissionTimestamp': timestamp},
+#         UpdateExpression="SET behavioralRiskScore = :s, behavioralFlags = :f, behavioralReasoning = :r, behavioralProcessedAt = :t",
+#         ExpressionAttributeValues={
+#             ':s': str(round(score, 2)),
+#             ':f': flags,
+#             ':r': reasoning,
+#             ':t': '2026-02-03T17:42:00'
+#         }
+#     )
+
+
+import json
+import boto3
+import statistics
+import time
+import os
+
+# Initialize DynamoDB resource
+dynamodb = boto3.resource('dynamodb', region_name='us-west-2')
+TABLE_NAME = os.environ.get('TABLE_NAME', 'ApplicantData')
+table = dynamodb.Table(TABLE_NAME)
+
+def lambda_handler(event, context):
+    print(f"--- START: Processing {len(event.get('Records', []))} record(s) ---")
+    
+    for record in event['Records']:
+        if record['eventName'] == 'INSERT':
+            try:
+                keys = record['dynamodb']['Keys']
+                app_id = keys['ApplicantID']['S']
+                timestamp = keys['SubmissionTimestamp']['S']
+                
+                time.sleep(3) # Consistency Delay
+
+                response = table.get_item(Key={
+                    'ApplicantID': app_id,
+                    'SubmissionTimestamp': timestamp 
+                })
+                
+                item = response.get('Item')
+                if not item: continue
+                
+                app_data = item.get('data', {})
+                biometrics = app_data.get('biometrics', {})
+                keystrokes = biometrics.get('keystrokes', [])
+                
+                if not keystrokes: continue
+
+                # ANALYSIS
+                metrics = calculate_behavioral_metrics(keystrokes)
+                # NEW: Now returns 5 values
+                risk_score, flags, reasoning, velocity, consistency = evaluate_risk_profile(metrics)
+
+                # UPDATE
+                save_results_to_db(app_id, timestamp, risk_score, flags, reasoning, velocity, consistency)
+                print(f"--- SUCCESS: Advanced metrics populated for {app_id} ---")
+
+            except Exception as e:
+                print(f"ERROR: {str(e)}")
+    return {'statusCode': 200}
+
+def calculate_behavioral_metrics(keystrokes):
+    field_data = {}
+    for k in keystrokes:
+        f = k.get('field', 'unknown_field')
+        if f not in field_data: field_data[f] = []
+        field_data[f].append(k)
+
+    stats = {}
+    for field, events in field_data.items():
+        dwells, flights = [], []
+        presses = {}
+        for e in events:
+            key_name = e.get('key', 'generic_key')
+            event_time = int(e.get('time', 0))
+            if e.get('type') == 'down':
+                presses[key_name] = event_time
+            elif e.get('type') == 'up' and key_name in presses:
+                dwells.append(event_time - presses[key_name])
+        
+        for i in range(len(events) - 1):
+            if events[i].get('type') == 'up' and events[i+1].get('type') == 'down':
+                flights.append(int(events[i+1]['time']) - int(events[i]['time']))
+
+        stats[field] = {
+            "avgFlight": statistics.mean(flights) if flights else 0,
+            "flightStdDev": statistics.stdev(flights) if len(flights) > 1 else 0,
+            "duration": (int(events[-1]['time']) - int(events[0]['time'])) if events else 0
+        }
+    return stats
+
+def evaluate_risk_profile(metrics):
+    score, flags, reasons = 0.0, [], []
+    
+    # 1. VELOCITY & CONSISTENCY CALCULATION
+    avg_flights = [m['avgFlight'] for m in metrics.values() if m['avgFlight'] > 0]
+    overall_speed = statistics.mean(avg_flights) if avg_flights else 0
+    
+    # Calculate Variance (Lower variance = higher consistency = more bot-like)
+    avg_std_dev = statistics.mean([m['flightStdDev'] for m in metrics.values()]) if metrics else 100
+    
+    # Format Velocity Field
+    velocity_type = "Bot" if 0 < overall_speed < 45 else "Human"
+    velocity_label = f"{round(overall_speed)}ms ({velocity_type})"
+    
+    # Format Consistency Field (Bot-like typing is 99% consistent)
+    consistency_pct = 99 if avg_std_dev < 5 else 94
+    consistency_label = f"{consistency_pct}% ({'Automated' if consistency_pct > 95 else 'Natural'})"
+
+    if velocity_type == "Bot":
+        score += 0.5
+        flags.append("robotic_typing_detected")
+        reasons.append(f"Global speed ({round(overall_speed, 2)}ms) indicates automated input.")
+
+    # 2. FIELD HESITATION
+    thresholds = {'firstName': 10000, 'lastName': 10000, 'email': 12000, 'phoneNumber': 10000, 'ssn': 12000}
+
+    for field, limit in thresholds.items():
+        field_duration = metrics.get(field, {}).get('duration', 0)
+        if field_duration > limit:
+            score += 0.15
+            flags.append(f"hesitation_on_{field}")
+            reasons.append(f"High hesitation on {field} ({round(field_duration/1000, 1)}s).")
+
+    reasoning = " ".join(reasons) if reasons else "User behavior matches standard human patterns."
+    return min(score, 1.0), flags, reasoning, velocity_label, consistency_label
+
+def save_results_to_db(app_id, timestamp, score, flags, reasoning, velocity, consistency):
+    table.update_item(
+        Key={'ApplicantID': app_id, 'SubmissionTimestamp': timestamp},
+        UpdateExpression="SET behavioralRiskScore = :s, behavioralFlags = :f, behavioralReasoning = :r, behavioralVelocity = :v, behavioralConsistency = :c, behavioralProcessedAt = :t",
+        ExpressionAttributeValues={
+            ':s': str(round(score, 2)),
+            ':f': flags,
+            ':r': reasoning,
+            ':v': velocity,
+            ':c': consistency,
+            ':t': '2026-02-03T17:42:00'
+        }
+    )

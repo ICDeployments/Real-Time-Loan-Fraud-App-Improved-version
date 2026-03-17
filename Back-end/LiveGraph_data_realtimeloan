@@ -1,0 +1,212 @@
+# import boto3
+# import json
+# from datetime import datetime, timedelta
+# from boto3.dynamodb.conditions import Attr
+
+# def lambda_handler(event, context):
+#     # Initialize DynamoDB
+#     dynamodb = boto3.resource('dynamodb')
+#     table = dynamodb.Table('ApplicantData')
+    
+#     # 1. Setup Time Range (Last 7 Days)
+#     today = datetime.utcnow()
+#     # We create a dictionary with the last 7 days initialized to 0
+#     # This ensures the line graph shows "0" instead of a missing dot
+#     chart_dict = {}
+#     for i in range(7):
+#         date_str = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+#         chart_dict[date_str] = 0
+        
+#     # Start date for filtering DynamoDB (7 days ago at midnight)
+#     start_date_filter = (today - timedelta(days=7)).strftime('%Y-%m-%dT00:00:00')
+
+#     try:
+#         # 2. Scan the table
+#         # We use a FilterExpression to only get recent data
+#         response = table.scan(
+#             FilterExpression=Attr('SubmissionTimestamp').gte(start_date_filter)
+#         )
+#         items = response.get('Items', [])
+
+#         # 3. Aggregate Counts
+#         for item in items:
+#             # Extract date (YYYY-MM-DD) from the Sort Key
+#             date_key = item['SubmissionTimestamp'][:10]
+#             if date_key in chart_dict:
+#                 chart_dict[date_key] += 1
+
+#         # 4. Format for Charting (Sorted List of Objects)
+#         # Result: [{"date": "2026-02-05", "applicants": 4}, ...]
+#         final_data = [
+#             {"date": d, "applicants": chart_dict[d]} 
+#             for d in sorted(chart_dict.keys())
+#         ]
+
+#         return {
+#             'statusCode': 200,
+#             'headers': {
+#                 'Content-Type': 'application/json',
+#                 'Access-Control-Allow-Headers': 'Content-Type',
+#                 'Access-Control-Allow-Origin': '*', # Allows any domain to call the API
+#                 'Access-Control-Allow-Methods': 'GET,OPTIONS'
+#             },
+#             'body': json.dumps(final_data)
+#         }
+
+#     except Exception as e:
+#         print(f"Error: {str(e)}")
+#         return {
+#             'statusCode': 500,
+#             'headers': {
+#                 'Access-Control-Allow-Origin': '*'
+#             },
+#             'body': json.dumps({'error': 'Internal Server Error'})
+#         }
+
+
+# import boto3
+# import json
+# from datetime import datetime, timedelta
+# from boto3.dynamodb.conditions import Attr
+
+# def lambda_handler(event, context):
+#     dynamodb = boto3.resource('dynamodb')
+#     table = dynamodb.Table('ApplicantData')
+    
+#     # 1. Get status from payload (defaults to None if not provided)
+#     status_filter = event.get('kyc_status')
+    
+#     # 2. Setup Time Range
+#     today = datetime.utcnow()
+#     chart_dict = {}
+#     for i in range(7):
+#         date_str = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+#         chart_dict[date_str] = 0
+        
+#     start_date_filter = (today - timedelta(days=7)).strftime('%Y-%m-%dT00:00:00')
+
+#     try:
+#         # 3. Build Dynamic Filter
+#         # We always filter by date. If status_filter exists, we add it.
+#         filter_exp = Attr('SubmissionTimestamp').gte(start_date_filter)
+        
+#         if status_filter:
+#             # This ensures we only get "Rejected" or "Approved" items from DynamoDB
+#             filter_exp = filter_exp & Attr('kyc_status').eq(status_filter)
+
+#         response = table.scan(FilterExpression=filter_exp)
+#         items = response.get('Items', [])
+
+#         # 4. Aggregate Counts
+#         for item in items:
+#             date_key = item['SubmissionTimestamp'][:10]
+#             if date_key in chart_dict:
+#                 chart_dict[date_key] += 1
+
+#         final_data = [
+#             {"date": d, "applicants": chart_dict[d]} 
+#             for d in sorted(chart_dict.keys())
+#         ]
+
+#         return {
+#             'statusCode': 200,
+#             'headers': {
+#                 'Content-Type': 'application/json',
+#                 'Access-Control-Allow-Origin': '*'
+#             },
+#             'body': json.dumps(final_data)
+#         }
+
+#     except Exception as e:
+#         print(f"Error: {str(e)}")
+#         return {
+#             'statusCode': 500,
+#             'body': json.dumps({'error': str(e)})
+#         }
+
+
+import boto3
+import json
+from datetime import datetime, timedelta
+from boto3.dynamodb.conditions import Attr
+
+def lambda_handler(event, context):
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table('ApplicantData')
+    
+    # 1. Robust Payload Parsing
+    # Handles API Gateway (string body) and Lambda Console (dict)
+    body = event
+    if isinstance(event.get('body'), str):
+        try:
+            body = json.loads(event['body'])
+        except Exception:
+            body = {}
+    
+    # Get status and normalize (strip spaces)
+    status_filter = body.get('kyc_status')
+    if status_filter:
+        status_filter = status_filter.strip()
+
+    # 2. Setup Time Range (Last 7 Days)
+    today = datetime.utcnow()
+    chart_dict = {}
+    for i in range(7):
+        date_str = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+        chart_dict[date_str] = 0
+        
+    # Start date string for comparison
+    start_date_filter = (today - timedelta(days=7)).strftime('%Y-%m-%dT00:00:00')
+
+    try:
+        # 3. Build Dynamic Filter
+        # Always filter by date first
+        filter_exp = Attr('SubmissionTimestamp').gte(start_date_filter)
+        
+        # Only add status filter if it exists in the payload
+        if status_filter:
+            filter_exp = filter_exp & Attr('kyc_status').eq(status_filter)
+
+        # 4. Scan Table (with Pagination support)
+        items = []
+        scan_kwargs = {'FilterExpression': filter_exp}
+        
+        # Loop handles cases where table > 1MB
+        while True:
+            response = table.scan(**scan_kwargs)
+            items.extend(response.get('Items', []))
+            
+            # If LastEvaluatedKey exists, there is more data to scan
+            if 'LastEvaluatedKey' in response:
+                scan_kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
+            else:
+                break
+
+        # 5. Aggregate Counts into the dictionary
+        for item in items:
+            ts = item.get('SubmissionTimestamp', '')
+            date_key = ts[:10]  # Extracts YYYY-MM-DD
+            if date_key in chart_dict:
+                chart_dict[date_key] += 1
+
+        # 6. Format for Chart.js / Frontend
+        final_data = [
+            {"date": d, "applicants": chart_dict[d]} 
+            for d in sorted(chart_dict.keys())
+        ]
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps(final_data)
+        }
+
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': "Internal Server Error", "details": str(e)})
+        }
