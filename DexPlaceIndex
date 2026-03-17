@@ -1,0 +1,333 @@
+# import json, boto3, logging, base64, urllib3, time
+# from boto3.dynamodb.conditions import Attr
+
+# logger = logging.getLogger()
+# logger.setLevel(logging.INFO)
+
+# http = urllib3.PoolManager()
+# dynamodb = boto3.resource('dynamodb')
+# secrets_client = boto3.client('secretsmanager')
+
+# # --- CONFIG ---
+# SESSION_TABLE = "DEX_Session_Store"
+# APPLICANT_TABLE = "ApplicantData"
+# MAXMIND_SECRET = "bluebolt/maxmind/credentials"
+
+# def get_maxmind_data(ip):
+#     try:
+#         if ip in ["0.0.0.0", "127.0.0.1"]: return {"is_proxy": False, "city": "Test_Env", "country": "XX"}
+#         creds = json.loads(secrets_client.get_secret_value(SecretId=MAXMIND_SECRET)['SecretString'])
+#         auth = base64.b64encode(f"{creds['MAXMIND_ACCOUNT_ID']}:{creds['MAXMIND_LICENSE_KEY']}".encode()).decode()
+#         res = http.request('GET', f"https://geoip.maxmind.com/geoip/v2.1/city/{ip}", headers={'Authorization': f'Basic {auth}'})
+#         data = json.loads(res.data.decode('utf-8'))
+#         return {
+#             "is_proxy": data.get('traits', {}).get('is_anonymous_proxy', False),
+#             "city": data.get('city', {}).get('names', {}).get('en', 'Unknown'),
+#             "country": data.get('country', {}).get('iso_code', 'Unknown')
+#         }
+#     except: return {"is_proxy": False, "city": "Unknown", "country": "Unknown"}
+
+# def find_applicant_id_in_source(sess_id):
+#     """Scan ApplicantData for the nested session_id."""
+#     app_table = dynamodb.Table(APPLICANT_TABLE)
+#     try:
+#         response = app_table.scan(
+#             FilterExpression=Attr('data.session_id').eq(sess_id),
+#             ProjectionExpression="ApplicantID",
+#             ConsistentRead=True 
+#         )
+#         if response.get('Items'): return response['Items'][0]['ApplicantID']
+#     except Exception as e: logger.error(f"Scan Error: {str(e)}")
+#     return None
+
+# def calculate_risk(payload, ip):
+#     flags = []
+#     xai_lines = []
+    
+#     # 1. External (0.2)
+#     geo = get_maxmind_data(ip)
+#     ext_score = 1.0
+#     if geo['is_proxy']:
+#         flags.append("VPN_DETECTED")
+#         ext_score -= 1.0
+#         xai_lines.append(f"External: Risk detected. IP {ip} is a proxy in {geo['city']}.")
+#     else: xai_lines.append(f"External: Endpoint verified in {geo['city']}, {geo['country']}.")
+
+#     # 2. Device (0.5)
+#     comps = payload.get('components', {})
+#     dev_score = 1.0
+#     if payload.get('isEmulatorFlag') or comps.get('hardwareConcurrency', {}).get('value', 4) < 2:
+#         flags.append("EMULATOR_SUSPECTED")
+#         dev_score -= 0.6
+#         xai_lines.append("Device: Concurrency metrics suggest virtualization.")
+#     else: xai_lines.append("Device: Hardware footprint matches standard profile.")
+
+#     # 3. Network (0.3)
+#     net = payload.get('network', {})
+#     net_score = 1.0
+#     rtt = net.get('rtt', 0)
+#     if rtt > 300:
+#         flags.append("HIGH_LATENCY")
+#         net_score -= 0.5
+#         xai_lines.append(f"Network: Instability detected (RTT {rtt}ms).")
+#     else: xai_lines.append(f"Network: Connection stable (RTT {rtt}ms).")
+
+#     final_score = (0.5 * dev_score) + (0.3 * net_score) + (0.2 * ext_score)
+#     return {"score": round(max(0.0, min(1.0, final_score)), 2), "flags": flags, "xai": xai_lines}
+
+# # --- MAIN HANDLER ---
+# def lambda_handler(event, context):
+#     logger.info(f"Event: {json.dumps(event)}")
+#     session_table = dynamodb.Table(SESSION_TABLE)
+#     timestamp_now = int(time.time()) # Timestamp for GSI
+
+#     # === BRANCH 1: STREAM PROCESSING ===
+#     if 'Records' in event:
+#         count = 0
+#         for record in event['Records']:
+#             if record['eventName'] in ['INSERT', 'MODIFY']:
+#                 new_image = record['dynamodb']['NewImage']
+#                 app_id = new_image.get('ApplicantID', {}).get('S')
+#                 sess_id = new_image.get('data', {}).get('M', {}).get('session_id', {}).get('S')
+
+#                 if app_id and sess_id:
+#                     session_table.update_item(
+#                         Key={'session_id': sess_id},
+#                         UpdateExpression="SET ApplicantID = :a, ingestion_status = :s, #ts = :t",
+#                         ExpressionAttributeNames={'#ts': 'timestamp'},
+#                         ExpressionAttributeValues={':a': app_id, ':s': 'COMPLETED', ':t': timestamp_now}
+#                     )
+#                     count += 1
+#         return f"Stream processed {count} records."
+
+#     # === BRANCH 2: API PROCESSING ===
+#     if isinstance(event.get('body'), str): payload = json.loads(event['body'])
+#     else: payload = event.get('body') or event
+
+#     sess_id = payload.get('session_id') or payload.get('data', {}).get('session_id')
+#     payload_app_id = payload.get('ApplicantID')
+
+#     if not sess_id: return {"statusCode": 400, "body": json.dumps({"error": "session_id missing"})}
+
+#     # Triangle ID Check
+#     current_record = session_table.get_item(Key={'session_id': sess_id}).get('Item', {})
+#     existing_id = current_record.get('ApplicantID')
+
+#     if existing_id and existing_id != "PENDING":
+#         final_app_id = existing_id
+#         logger.info(f"Using Existing Link: {final_app_id}")
+#     else:
+#         db_id = find_applicant_id_in_source(sess_id)
+#         if db_id: final_app_id = db_id
+#         elif payload_app_id: final_app_id = payload_app_id
+#         else: final_app_id = "PENDING"
+
+#     # Risk Calculation
+#     headers = event.get('headers', {})
+#     real_ip = headers.get('X-Forwarded-For', headers.get('x-forwarded-for', '')).split(',')[0].strip() or \
+#               event.get('requestContext', {}).get('identity', {}).get('sourceIp', '0.0.0.0')
+    
+#     risk = calculate_risk(payload, real_ip)
+
+#     # Bridge Update WITH TIMESTAMP
+#     session_table.update_item(
+#         Key={'session_id': sess_id},
+#         UpdateExpression="SET ApplicantID = :aid, trust_score = :s, captured_flags = :f, "
+#                          "real_ip = :ip, XAI_reasoning = :xai, ingestion_status = :st, "
+#                          "#ts = :t, "
+#                          "live_logs = list_append(if_not_exists(live_logs, :empty), :new_log)",
+#         ExpressionAttributeNames={'#ts': 'timestamp'},
+#         ExpressionAttributeValues={
+#             ':aid': final_app_id,
+#             ':s': str(risk['score']),
+#             ':f': risk['flags'],
+#             ':ip': real_ip,
+#             ':xai': risk['xai'],
+#             ':st': 'COMPLETED',
+#             ':t': timestamp_now,
+#             ':empty': [],
+#             ':new_log': [f"Analysis Complete. ID: {final_app_id}. Score: {risk['score']}"]
+#         }
+#     )
+
+#     fresh = session_table.get_item(Key={'session_id': sess_id}).get('Item', {})
+#     return {
+#         "statusCode": 200, "headers": {"Content-Type": "application/json"},
+#         "body": json.dumps({
+#             "session_id": sess_id, "ApplicantID": fresh.get('ApplicantID'),
+#             "trust_score": fresh.get('trust_score'), "status": "SUCCESS"
+#         })
+#     }
+
+
+import json, boto3, logging, base64, urllib3, time
+from boto3.dynamodb.conditions import Attr
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+http = urllib3.PoolManager()
+dynamodb = boto3.resource('dynamodb')
+secrets_client = boto3.client('secretsmanager')
+
+# --- CONFIG ---
+SESSION_TABLE = "DEX_Session_Store"
+APPLICANT_TABLE = "ApplicantData"
+MAXMIND_SECRET = "bluebolt/maxmind/credentials"
+
+def get_maxmind_data(ip):
+    try:
+        if ip in ["0.0.0.0", "127.0.0.1"]: return {"is_proxy": False, "city": "Test_Env", "country": "XX"}
+        creds = json.loads(secrets_client.get_secret_value(SecretId=MAXMIND_SECRET)['SecretString'])
+        auth = base64.b64encode(f"{creds['MAXMIND_ACCOUNT_ID']}:{creds['MAXMIND_LICENSE_KEY']}".encode()).decode()
+        res = http.request('GET', f"https://geoip.maxmind.com/geoip/v2.1/city/{ip}", headers={'Authorization': f'Basic {auth}'})
+        data = json.loads(res.data.decode('utf-8'))
+        return {
+            "is_proxy": data.get('traits', {}).get('is_anonymous_proxy', False),
+            "city": data.get('city', {}).get('names', {}).get('en', 'Unknown'),
+            "country": data.get('country', {}).get('iso_code', 'Unknown')
+        }
+    except: return {"is_proxy": False, "city": "Unknown", "country": "Unknown"}
+
+def find_applicant_id_in_source(sess_id):
+    """Scan ApplicantData for the nested session_id."""
+    app_table = dynamodb.Table(APPLICANT_TABLE)
+    try:
+        response = app_table.scan(
+            FilterExpression=Attr('data.session_id').eq(sess_id),
+            ProjectionExpression="ApplicantID",
+            ConsistentRead=True 
+        )
+        if response.get('Items'): return response['Items'][0]['ApplicantID']
+    except Exception as e: logger.error(f"Scan Error: {str(e)}")
+    return None
+
+def calculate_risk(payload, ip):
+    flags = []
+    xai_lines = []
+    
+    # 1. External (0.2)
+    geo = get_maxmind_data(ip)
+    ext_score = 1.0
+    if geo['is_proxy']:
+        flags.append("VPN_DETECTED")
+        ext_score -= 1.0
+        xai_lines.append(f"External: Risk detected. IP {ip} is a proxy in {geo['city']}.")
+    else: xai_lines.append(f"External: Endpoint verified in {geo['city']}, {geo['country']}.")
+
+    # 2. Device (0.5)
+    comps = payload.get('components', {})
+    dev_score = 1.0
+    if payload.get('isEmulatorFlag') or comps.get('hardwareConcurrency', {}).get('value', 4) < 2:
+        flags.append("EMULATOR_SUSPECTED")
+        dev_score -= 0.6
+        xai_lines.append("Device: Concurrency metrics suggest virtualization.")
+    else: xai_lines.append("Device: Hardware footprint matches standard profile.")
+
+    # 3. Network (0.3)
+    net = payload.get('network', {})
+    net_score = 1.0
+    rtt = net.get('rtt', 0)
+    if rtt > 300:
+        flags.append("HIGH_LATENCY")
+        net_score -= 0.5
+        xai_lines.append(f"Network: Instability detected (RTT {rtt}ms).")
+    else: xai_lines.append(f"Network: Connection stable (RTT {rtt}ms).")
+
+    # Add SAFE_ORIGIN if no flags triggered
+    if not flags:
+        flags.append("SAFE_ORIGIN")
+
+    final_score = (0.5 * dev_score) + (0.3 * net_score) + (0.2 * ext_score)
+    return {"score": round(max(0.0, min(1.0, final_score)), 2), "flags": flags, "xai": xai_lines}
+
+# --- MAIN HANDLER ---
+def lambda_handler(event, context):
+    logger.info(f"Event: {json.dumps(event)}")
+    session_table = dynamodb.Table(SESSION_TABLE)
+    timestamp_now = int(time.time()) # Timestamp for GSI
+
+    # === BRANCH 1: STREAM PROCESSING ===
+    if 'Records' in event:
+        count = 0
+        for record in event['Records']:
+            if record['eventName'] in ['INSERT', 'MODIFY']:
+                new_image = record['dynamodb']['NewImage']
+                app_id = new_image.get('ApplicantID', {}).get('S')
+                sess_id = new_image.get('data', {}).get('M', {}).get('session_id', {}).get('S')
+
+                if app_id and sess_id:
+                    session_table.update_item(
+                        Key={'session_id': sess_id},
+                        UpdateExpression="SET ApplicantID = :a, ingestion_status = :s, #ts = :t",
+                        ExpressionAttributeNames={'#ts': 'timestamp'},
+                        ExpressionAttributeValues={':a': app_id, ':s': 'COMPLETED', ':t': timestamp_now}
+                    )
+                    count += 1
+        return f"Stream processed {count} records."
+
+    # === BRANCH 2: API PROCESSING ===
+    if isinstance(event.get('body'), str): payload = json.loads(event['body'])
+    else: payload = event.get('body') or event
+
+    sess_id = payload.get('session_id') or payload.get('data', {}).get('session_id')
+    payload_app_id = payload.get('ApplicantID')
+
+    if not sess_id: return {"statusCode": 400, "body": json.dumps({"error": "session_id missing"})}
+
+    # Triangle ID Check
+    current_record = session_table.get_item(Key={'session_id': sess_id}).get('Item', {})
+    existing_id = current_record.get('ApplicantID')
+
+    if existing_id and existing_id != "PENDING":
+        final_app_id = existing_id
+        logger.info(f"Using Existing Link: {final_app_id}")
+    else:
+        db_id = find_applicant_id_in_source(sess_id)
+        if db_id: final_app_id = db_id
+        elif payload_app_id: final_app_id = payload_app_id
+        else: final_app_id = "PENDING"
+
+    # Risk Calculation
+    headers = event.get('headers', {})
+    real_ip = headers.get('X-Forwarded-For', headers.get('x-forwarded-for', '')).split(',')[0].strip() or \
+              event.get('requestContext', {}).get('identity', {}).get('sourceIp', '0.0.0.0')
+    
+    risk = calculate_risk(payload, real_ip)
+    
+    # Generate Reasoning String
+    if "SAFE_ORIGIN" in risk['flags']:
+        reasoning = "Connection and device profile verified as low risk."
+    else:
+        reasoning = f"Risk flags detected: {', '.join(risk['flags'])}. Trust score adjusted based on telemetry."
+
+    # Bridge Update WITH TIMESTAMP
+    session_table.update_item(
+        Key={'session_id': sess_id},
+        UpdateExpression="SET ApplicantID = :aid, trust_score = :s, captured_flags = :f, "
+                         "real_ip = :ip, XAI_reasoning = :xai, ingestion_status = :st, "
+                         "#ts = :t, "
+                         "live_logs = list_append(if_not_exists(live_logs, :empty), :new_log)",
+        ExpressionAttributeNames={'#ts': 'timestamp'},
+        ExpressionAttributeValues={
+            ':aid': final_app_id,
+            ':s': str(risk['score']),
+            ':f': risk['flags'],
+            ':ip': real_ip,
+            ':xai': risk['xai'],
+            ':st': 'COMPLETED',
+            ':t': timestamp_now,
+            ':empty': [],
+            ':new_log': [f"Analysis Complete. ID: {final_app_id}. Score: {risk['score']}"]
+        }
+    )
+
+    fresh = session_table.get_item(Key={'session_id': sess_id}).get('Item', {})
+    return {
+        "statusCode": 200, "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({
+            "session_id": sess_id, "ApplicantID": fresh.get('ApplicantID'),
+            "trust_score": fresh.get('trust_score'), "status": "SUCCESS",
+            "Reasoning": reasoning
+        })
+    }
